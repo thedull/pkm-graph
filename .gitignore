@@ -1,0 +1,9 @@
+.venv/
+__pycache__/
+*.pyc
+.sync-state.json
+viz.pid
+viz.log
+viz/node_modules/
+viz/.env
+viz/test-results/

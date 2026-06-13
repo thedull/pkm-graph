@@ -1,0 +1,5 @@
+.env
+node_modules/
+viz.log
+viz.pid
+test-results/
