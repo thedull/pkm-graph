@@ -6,7 +6,8 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-VAULT_ROOT="$(cd "$SCRIPT_DIR/../pkm" && pwd)"
+VAULT_ROOT="${VAULT_ROOT:-$(cd "$SCRIPT_DIR/../pkm" && pwd)}"
+export VAULT_ROOT
 VIZ_DIR="$SCRIPT_DIR/viz"
 BOLT="bolt://localhost:7687"
 NEO4J_HTTP="http://localhost:7474"

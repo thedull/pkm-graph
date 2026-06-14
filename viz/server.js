@@ -7,9 +7,11 @@ const neo4j = require("neo4j-driver");
 const { streamText } = require("ai");
 const { createOpenAI } = require("@ai-sdk/openai");
 
-// vault root: 5 levels up from viz/ (viz→graph→pkm-evolution→projects→wiki→vault)
-const VAULT_ROOT = process.env.VAULT_ROOT ||
-  path.resolve(__dirname, "../../../../../");
+const VAULT_ROOT = process.env.VAULT_ROOT;
+if (!VAULT_ROOT) {
+  console.error("ERROR: VAULT_ROOT env var is required. Set it in viz/.env or run via start.sh");
+  process.exit(1);
+}
 
 function readNote(relPath) {
   const abs = path.join(VAULT_ROOT, relPath);
