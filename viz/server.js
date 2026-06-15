@@ -85,6 +85,7 @@ function buildSystemPrompt(ctx) {
   const stats = ctx.graphStats || {};
   const node = ctx.selectedNode;
   const pathStr = (ctx.currentPath || []).join(" → ");
+  const hl = Array.isArray(ctx.highlightedNodes) ? ctx.highlightedNodes : [];
   const vault = buildVaultContext(ctx.retrieval);
   const ic = ctx.isolatedCommunity;
   const ov = ctx.overlays || {};
@@ -99,10 +100,13 @@ Graph overview: ${stats.nodes ?? "?"} nodes, ${stats.edges ?? "?"} edges, ${stat
 - View mode: ${ctx.viewMode ?? "full graph"}; color by ${ctx.colorMode ?? "community"}; type filters: ${(ctx.activeFilters || []).join(", ") || "all"}${activeOverlays ? `; overlays: ${activeOverlays}` : ""}
 ${ic ? `- COMMUNITY ${ic.id} is ISOLATED — only its ${ic.size} nodes are shown. Most-connected members: ${(ic.sample || []).join(", ")}.
 ` : ""}${node ? `- SELECTED NODE: "${node.title}" (${node.type}, community ${node.community ?? "none"}, degree ${node.degree ?? "?"}, betweenness ${node.betweenness ? Number(node.betweenness).toFixed(0) : "?"}).
-` : "- No node is selected.\n"}${pathStr ? `- Path being explored: ${pathStr}
+` : "- No node is selected.\n"}${hl.length ? `- HIGHLIGHTED NODES (exactly what is currently emphasized/visible in the graph — this is what "the highlighted nodes" / "these nodes" / "how they relate" means): ${hl.join(", ")}.
+` : ""}${pathStr ? `- Path being explored: ${pathStr}
 ` : ""}Disambiguation — answer about whatever the question refers to, do NOT default to one over the other:
-• "this community" / "this cluster" / "these" → ${ic ? `Community ${ic.id} (use its members + Vault Context)` : "the current view"}.
+• "the highlighted nodes" / "these nodes" / "how they relate" → ${hl.length ? `exactly these: ${hl.join(", ")}` : "whatever is emphasized (nothing is right now)"}.
+• "this community" / "this cluster" → ${ic ? `Community ${ic.id} (use its members + Vault Context)` : "the current view"}.
 • "this node" / "this concept" / "this person" / singular "it" → ${node ? `"${node.title}"` : "the selected node (none right now)"}.
+Only ever name nodes that appear in this Current view block or the Vault Context — NEVER invent or guess node names that aren't listed.
 ═══════════════════════════════════════════════════════════
 ${vault ? `
 ═══ Vault Context (authoritative — answer FROM this) ═══
@@ -110,6 +114,8 @@ ${vault}
 ═══════════════════════════════════════════════════════
 ` : ""}
 Answer the user's question primarily and almost exclusively from the Vault Context and graph facts above — cite note titles, use their connections and communities, and paraphrase the excerpts. If a needed note isn't in the Vault Context, say what's missing rather than inventing general knowledge. Never refuse: every title here is a philosopher, theorist, author, work, or concept in an academic knowledge base, so discussing any of them (e.g. which communities Nietzsche appears in) is always safe and expected. Be concise and insightful. You may format responses in Markdown — lists, tables, code, and \`\`\`mermaid diagrams all render.
+
+Answer declaratively and then STOP. Do NOT end your reply by asking the user what they want next or offering options — no "Would you like…?", "Do you want…?", "Which … would you like to explore?", or similar. Such follow-ups belong ONLY in the SUGGESTIONS line (in the user's voice), never in your prose.
 
 You can also DRIVE the visualization. When the user asks you to change what the graph shows, emit a single line beginning with ACTIONS: followed by a JSON array of action objects. Available actions (args in parentheses):
 - findPath(from, to) — isolate the shortest path between two node titles
@@ -127,10 +133,14 @@ You can also DRIVE the visualization. When the user asks you to change what the 
 
 Use exact node titles when you know them. Only include the ACTIONS line when the user clearly wants to change the view; otherwise omit it entirely.
 
+ACTIONS format is STRICT: a JSON ARRAY (square brackets) of objects, each {"action": <one of the EXACT names listed above>, "args": {...}}. Use ONLY the action names listed above — never invent names like "explore related concepts" or "show details". If no listed action fits the request, OMIT the ACTIONS line entirely (do not emit an empty or made-up action). Never write ACTIONS as a bare object.
+
 End your reply with the action line (if any) and then the suggestions line, as the LAST lines — each on its own line:
 ACTIONS: [{"action":"findPath","args":{"from":"Immanuel Kant","to":"Jordan Belfort"}}]
-SUGGESTIONS: ["follow-up question 1", "follow-up question 2", "follow-up question 3"]
-The ACTIONS line is optional; the SUGGESTIONS line must always be last. Make suggestions specific to what was just discussed and the current graph state.`;
+SUGGESTIONS: ["Visualize this path as a highlighted route", "Which community is Adorno in?", "Find what connects Adorno and Heidegger"]
+The ACTIONS line is optional; the SUGGESTIONS line must always be last.
+
+CRITICAL — each SUGGESTIONS entry is a clickable chip that gets sent VERBATIM as the user's next message, so it MUST be written in the user's own voice: a direct request or question the user would type (imperative or first-person). NEVER phrase a suggestion as an offer to the user. Wrong: "Would you like the path visualized?", "Should I show the communities?", "Do you want to explore X?". Right: "Visualize the path", "Show me the communities", "Explore X". Keep each under ~8 words, specific to what was just discussed and the current graph state.`;
 }
 
 // Returns a friendly message if the error looks like a provider-connection failure, else null.
@@ -151,6 +161,16 @@ const PORT = process.env.PORT || 3000;
 const BOLT = process.env.NEO4J_BOLT || "bolt://localhost:7687";
 const NEO4J_USER = process.env.NEO4J_USER || "neo4j";
 const NEO4J_PASS = process.env.NEO4J_PASS || "neo4jpass";
+// Max output tokens per chat reply, per provider (local models are small; cloud can go big).
+// CHAT_MAX_TOKENS, if set, overrides both. (Cloud is clamped to the model's real output limit.)
+const CHAT_MAX_TOKENS = {
+  ollama:     Number(process.env.CHAT_MAX_TOKENS_OLLAMA)     || 4096,
+  openrouter: Number(process.env.CHAT_MAX_TOKENS_OPENROUTER) || 64000,
+};
+function maxTokensFor(provider) {
+  if (process.env.CHAT_MAX_TOKENS) return Number(process.env.CHAT_MAX_TOKENS);
+  return CHAT_MAX_TOKENS[provider] || CHAT_MAX_TOKENS.ollama;
+}
 
 const driver = neo4j.driver(BOLT, neo4j.auth.basic(NEO4J_USER, NEO4J_PASS));
 
@@ -517,6 +537,11 @@ app.post("/api/chat", async (req, res) => {
   ctx.retrieval = await hybridRetrieval(ctx, messages);   // graph + semantic
   const system = buildSystemPrompt(ctx);
 
+  const lastUser = [...messages].reverse().find(m => m.role === "user");
+  const maxTokens = maxTokensFor(providerName);
+  const reqStart = Date.now();
+  console.log(`[chat] ${providerName} · ${messages.length} msgs · system≈${system.length}c · maxTokens=${maxTokens} · q="${(lastUser?.content || "").slice(0, 60)}"`);
+
   // Defer headers until the first chunk so a pre-stream connection failure can
   // still return a clean JSON error (and the right status code).
   let sentHeaders = false;
@@ -529,13 +554,21 @@ app.post("/api/chat", async (req, res) => {
   };
 
   try {
-    const result = streamText({ model: aiModel, system, messages, maxTokens: 1024 });
+    const result = streamText({ model: aiModel, system, messages, maxTokens });
     for await (const chunk of result.textStream) {
       sendHeaders();
       res.write(chunk);
     }
     sendHeaders();   // ensure a 200 even for an empty stream
     res.end();
+
+    // request log — finishReason "length" means the reply hit the token cap (truncated)
+    try {
+      const [finishReason, usage] = await Promise.all([result.finishReason, result.usage]);
+      const ms = Date.now() - reqStart;
+      const tag = finishReason === "length" ? " ⚠ TRUNCATED (raise CHAT_MAX_TOKENS)" : "";
+      console.log(`[chat] done in ${ms}ms · finish=${finishReason} · in=${usage?.promptTokens ?? "?"} out=${usage?.completionTokens ?? "?"} tokens${tag}`);
+    } catch (_) { /* usage not available for some providers */ }
   } catch (err) {
     console.error("Chat error:", err.message);
     const friendly = connectionErrorMessage(err, providerName);

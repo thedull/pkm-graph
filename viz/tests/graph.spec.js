@@ -153,6 +153,31 @@ test.describe("Display controls", () => {
     await expect(sel).toHaveValue("betweenness");
   });
 
+  test("focusing a node dims links outside its neighborhood", async ({ page }) => {
+    await page.goto("/");
+    await page.waitForSelector("canvas", { timeout: 15000 });
+    await page.waitForFunction(() => typeof allNodes !== "undefined" && allNodes.length > 0, { timeout: 10000 });
+
+    const dim = await page.evaluate(() => {
+      const gn = Graph.graphData().nodes.find(x => x.id === allNodes[10].id) || allNodes[10];
+      onNodeClick(gn);
+      const links = Graph.graphData().links;
+      const has = id => highlightIds.has(id);
+      const outside = links.find(l => !(has(l.source.id ?? l.source) && has(l.target.id ?? l.target)));
+      const within = links.find(l => has(l.source.id ?? l.source) && has(l.target.id ?? l.target));
+      return {
+        count: highlightIds.size,
+        outsideColor: outside ? Graph.linkColor()(outside) : null,
+        outsideWidth: outside ? Graph.linkWidth()(outside) : null,
+        withinColor: within ? Graph.linkColor()(within) : null,
+      };
+    });
+    expect(dim.count).toBeGreaterThan(0);
+    if (dim.outsideColor) expect(dim.outsideColor).toBe("rgba(70,70,90,0.05)");
+    if (dim.outsideWidth != null) expect(dim.outsideWidth).toBe(0.05);
+    if (dim.withinColor) expect(dim.withinColor).not.toBe("rgba(70,70,90,0.05)");
+  });
+
   test("hub overlay chip toggles active", async ({ page }) => {
     await page.goto("/");
     await page.waitForSelector("canvas", { timeout: 15000 });
@@ -648,6 +673,91 @@ test.describe("Copilot panel", () => {
     expect(captured.context.viewMode).toBe("community");
   });
 
+  test("an isolated path is sent to the Copilot as highlightedNodes", async ({ page }) => {
+    let captured = null;
+    await page.route("**/api/chat", async route => {
+      captured = route.request().postDataJSON();
+      await route.fulfill({ status: 200, headers: { "Content-Type": "text/plain; charset=utf-8" }, body: "ok\nSUGGESTIONS: []" });
+    });
+    await page.goto("/");
+    await page.waitForSelector("canvas", { timeout: 15000 });
+
+    // isolate a real path
+    await page.fill("#path-from", "Michel Foucault");
+    await page.fill("#path-to", "AI Alignment");
+    await page.keyboard.press("Escape");
+    await page.locator("#find-path-btn").click({ force: true });
+    await expect(page.locator("#find-path-btn")).toHaveText("Reset path", { timeout: 15000 });
+
+    await page.click("#copilot-btn");
+    await page.fill("#cop-input", "how do the highlighted nodes relate?");
+    await page.click("#cop-send");
+
+    await expect.poll(() => captured?.context?.highlightedNodes?.length || 0, { timeout: 10000 }).toBeGreaterThan(0);
+    expect(captured.context.highlightedNodes).toContain("Michel Foucault");
+    expect(captured.context.highlightedNodes).toContain("AI Alignment");
+  });
+
+  test("a malformed ACTIONS line never leaks into the message prose", async ({ page }) => {
+    // model emits a bad object (not array) with an invented action name
+    await page.route("**/api/chat", route => route.fulfill({
+      status: 200, headers: { "Content-Type": "text/plain; charset=utf-8" },
+      body: 'Here is the analysis of the cluster.\nACTIONS: {"action": "explore related concepts"}\nSUGGESTIONS: ["Show me the hubs"]',
+    }));
+    await page.goto("/");
+    await page.waitForSelector("canvas", { timeout: 15000 });
+    await page.click("#copilot-btn");
+    await page.fill("#cop-input", "tell me about the cluster");
+    await page.click("#cop-send");
+
+    const msg = page.locator(".cop-msg.assistant .cop-msg-text").last();
+    await expect(msg).toContainText("analysis of the cluster", { timeout: 10000 });
+    await expect(page.locator("#cop-messages")).not.toContainText("ACTIONS");
+    await expect(page.locator("#cop-messages")).not.toContainText("explore related concepts");
+    // invalid action is dropped → no tool-run group
+    await expect(page.locator(".cop-tools")).toHaveCount(0);
+    // suggestions still parse
+    await expect(page.locator("#cop-suggestions .cop-sug-chip")).toHaveCount(1);
+  });
+
+  test("Stop button cancels an in-flight reply", async ({ page }) => {
+    // slow response so we can interrupt it
+    await page.route("**/api/chat", async route => {
+      await new Promise(r => setTimeout(r, 4000));
+      try { await route.fulfill({ status: 200, headers: { "Content-Type": "text/plain; charset=utf-8" }, body: "late\nSUGGESTIONS: []" }); } catch (_) {}
+    });
+    await page.goto("/");
+    await page.waitForSelector("canvas", { timeout: 15000 });
+    await page.click("#copilot-btn");
+    await page.fill("#cop-input", "hello");
+    await page.click("#cop-send");
+
+    // button switches to Stop while streaming
+    await expect(page.locator("#cop-send")).toHaveClass(/stop/, { timeout: 5000 });
+    // press Stop
+    await page.click("#cop-send");
+    await expect(page.locator("#cop-send")).not.toHaveClass(/stop/);
+    await expect(page.locator(".cop-note")).toContainText("Stopped", { timeout: 5000 });
+  });
+
+  test("an empty model reply shows feedback instead of a silent blank bubble", async ({ page }) => {
+    // model returns no prose (only a suggestions line) — must not look like a hang
+    await page.route("**/api/chat", route => route.fulfill({
+      status: 200, headers: { "Content-Type": "text/plain; charset=utf-8" },
+      body: 'SUGGESTIONS: ["Show me the communities"]',
+    }));
+    await page.goto("/");
+    await page.waitForSelector("canvas", { timeout: 15000 });
+    await page.click("#copilot-btn");
+    await page.fill("#cop-input", "hi");
+    await page.click("#cop-send");
+
+    // explicit note appears; no empty assistant bubble lingers; suggestion still renders
+    await expect(page.locator(".cop-note")).toContainText("No reply text returned", { timeout: 10000 });
+    await expect(page.locator(".cop-msg.assistant")).toHaveCount(0);
+    await expect(page.locator("#cop-suggestions .cop-sug-chip")).toHaveCount(1);
+  });
+
   test("chat input shows a scrollbar only when overflowing", async ({ page }) => {
     await page.goto("/");
     await page.waitForSelector("canvas", { timeout: 15000 });
@@ -773,6 +883,25 @@ test.describe("Pathfinding panel", () => {
     await expect(page.locator("#path-extra .path-node-row")).toHaveCount(2);
     await page.locator("#path-extra .path-node-remove").first().click();
     await expect(page.locator("#path-extra .path-node-row")).toHaveCount(1);
+  });
+
+  test("Reset path clears the inputs and removes extra rows", async ({ page }) => {
+    await page.goto("/");
+    await page.waitForSelector("canvas", { timeout: 15000 });
+
+    await page.click("#path-add-node");
+    await page.fill("#path-from", "Michel Foucault");
+    await page.fill("#path-to", "AI Alignment");
+    await page.fill("#path-extra .path-node-input", "Friedrich Nietzsche");
+    await page.keyboard.press("Escape");
+    await page.locator("#find-path-btn").click({ force: true });
+    await expect(page.locator("#find-path-btn")).toHaveText("Reset path", { timeout: 15000 });
+
+    await page.locator("#find-path-btn").click({ force: true });
+    await expect(page.locator("#path-from")).toHaveValue("");
+    await expect(page.locator("#path-to")).toHaveValue("");
+    await expect(page.locator("#path-extra .path-node-row")).toHaveCount(0);
+    await expect(page.locator("#find-path-btn")).toHaveText("Find path");
   });
 
   test("connects 3 nodes via pairwise paths", async ({ page }) => {

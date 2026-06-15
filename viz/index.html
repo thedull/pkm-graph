@@ -8,6 +8,24 @@
     body { background: #0d0d14; color: #e2e2f0; font-family: 'Inter', system-ui, sans-serif; overflow: hidden; }
     #graph-container { position: fixed; inset: 0; }
 
+    /* ── Consistent, subtle scrollbars across all panels ──────────────── */
+    #sidebar, #ndp-body, #cop-messages, #cop-convo-list, .ac-drop, #help-box-body, #cop-input {
+      scrollbar-width: thin;
+      scrollbar-color: rgba(167,139,250,0.25) transparent;
+    }
+    #sidebar::-webkit-scrollbar, #ndp-body::-webkit-scrollbar, #cop-messages::-webkit-scrollbar,
+    #cop-convo-list::-webkit-scrollbar, .ac-drop::-webkit-scrollbar, #help-box-body::-webkit-scrollbar,
+    #cop-input::-webkit-scrollbar { width: 8px; height: 8px; }
+    #sidebar::-webkit-scrollbar-track, #ndp-body::-webkit-scrollbar-track, #cop-messages::-webkit-scrollbar-track,
+    #cop-convo-list::-webkit-scrollbar-track, .ac-drop::-webkit-scrollbar-track, #help-box-body::-webkit-scrollbar-track,
+    #cop-input::-webkit-scrollbar-track { background: transparent; }
+    #sidebar::-webkit-scrollbar-thumb, #ndp-body::-webkit-scrollbar-thumb, #cop-messages::-webkit-scrollbar-thumb,
+    #cop-convo-list::-webkit-scrollbar-thumb, .ac-drop::-webkit-scrollbar-thumb, #help-box-body::-webkit-scrollbar-thumb,
+    #cop-input::-webkit-scrollbar-thumb { background: rgba(167,139,250,0.25); border-radius: 4px; }
+    #sidebar::-webkit-scrollbar-thumb:hover, #ndp-body::-webkit-scrollbar-thumb:hover, #cop-messages::-webkit-scrollbar-thumb:hover,
+    #cop-convo-list::-webkit-scrollbar-thumb:hover, .ac-drop::-webkit-scrollbar-thumb:hover, #help-box-body::-webkit-scrollbar-thumb:hover,
+    #cop-input::-webkit-scrollbar-thumb:hover { background: rgba(167,139,250,0.45); }
+
     #sidebar {
       position: fixed; top: 0; left: 0;
       width: 270px; height: 100vh;
@@ -130,19 +148,19 @@
 
     /* ── Node Detail Panel (left-docked, independent of Copilot) ────── */
     #node-detail-panel {
-      position: fixed; top: 0; bottom: 0; left: 0;
-      width: 360px; max-width: calc(100vw - 60px);
+      position: fixed; top: 0; bottom: 0; left: var(--ndp-left, 270px);
+      width: 360px; max-width: calc(100vw - var(--ndp-left, 270px) - 20px);
       background: rgba(13,13,22,0.97);
       backdrop-filter: blur(16px);
       border-right: 1px solid rgba(255,255,255,0.08);
       display: flex; flex-direction: column;
       overflow: hidden;
-      z-index: 18;
-      transform: translateX(-100%);   /* hidden off the left edge */
+      z-index: 9;   /* below the sidebar (10) so it emerges from behind its right edge */
+      transform: translateX(-100%);   /* tucked behind the sidebar when closed */
       transition: transform 0.25s cubic-bezier(0.16,1,0.3,1);
     }
-    /* open: slide right to dock just past the sidebar (width set by JS) */
-    #node-detail-panel.open { transform: translateX(var(--ndp-left, 270px)); }
+    /* open: slide out from the sidebar's right edge */
+    #node-detail-panel.open { transform: translateX(0); }
 
     #ndp-header {
       display: flex; align-items: flex-start; gap: 10px;
@@ -297,6 +315,13 @@
     .cop-msg.assistant .cop-msg-text .mermaid-rendered { background: rgba(255,255,255,0.03); border-radius: 6px; padding: 8px; margin: 0.6em 0; text-align: center; }
     .cop-msg.assistant .cop-msg-text .mermaid-rendered svg { max-width: 100%; height: auto; }
 
+    /* subtle inline note (e.g. empty reply) */
+    .cop-note {
+      align-self: flex-start; font-size: 11px; color: #8a8aa8;
+      background: rgba(255,255,255,0.04); border: 1px solid rgba(255,255,255,0.08);
+      border-radius: 6px; padding: 5px 10px;
+    }
+
     /* error / disconnection bubble */
     .cop-msg-error .cop-msg-text {
       color: #fbbf24; font-size: 12px; line-height: 1.55;
@@ -395,6 +420,11 @@
     }
     #cop-send:hover:not(:disabled) { background: rgba(167,139,250,0.35); }
     #cop-send:disabled { opacity: 0.3; cursor: default; }
+    #cop-send.stop {
+      background: rgba(251,146,60,0.2); border-color: rgba(251,146,60,0.4); color: #fb923c;
+      font-size: 11px;
+    }
+    #cop-send.stop:hover { background: rgba(251,146,60,0.35); }
     #cop-empty {
       font-size: 11px; color: #2a2a42; text-align: center;
       padding: 20px 12px; line-height: 1.6;
@@ -614,7 +644,7 @@
     <div id="path-result"></div>
   </div>
 
-  <div style="font-size:10px;color:#2a2a40;margin-top:auto;padding-top:8px">Click a node to see its details · Right-click for quick info</div>
+  <div style="font-size:10px;color:#2a2a40;margin-top:auto;padding-top:8px">Click a node to see its details</div>
 
   <div id="resize-handle"></div>
 </div>
@@ -768,6 +798,7 @@ let currentPathChain = [];
 // copilot state
 let copilotProvider  = "ollama";
 let copilotStreaming  = false;
+let copilotAbort     = null;      // AbortController for the in-flight chat request
 let conversations    = [];        // [{ id, title, messages, updatedAt }]
 let currentConvId    = null;
 let mentionNodes     = [];        // nodes explicitly @-mentioned for the next message
@@ -796,6 +827,11 @@ const Graph = ForceGraph3D()(document.getElementById("graph-container"))
   })
   .nodeOpacity(0.92)
   .linkColor(l => {
+    // when a node is focused/highlighted, fade links outside the focused set
+    if (highlightIds.size > 0) {
+      const s = l.source?.id ?? l.source, t = l.target?.id ?? l.target;
+      if (!(highlightIds.has(s) && highlightIds.has(t))) return "rgba(70,70,90,0.05)";
+    }
     if (edgeMode === "bridge") {
       const s = nodeById[l.source?.id || l.source];
       const t = nodeById[l.target?.id || l.target];
@@ -810,6 +846,10 @@ const Graph = ForceGraph3D()(document.getElementById("graph-container"))
     return "rgba(80,80,100,0.12)";
   })
   .linkWidth(l => {
+    if (highlightIds.size > 0) {
+      const s = l.source?.id ?? l.source, t = l.target?.id ?? l.target;
+      if (!(highlightIds.has(s) && highlightIds.has(t))) return 0.05;
+    }
     if (edgeMode === "bridge") {
       const s = nodeById[l.source?.id || l.source];
       const t = nodeById[l.target?.id || l.target];
@@ -927,6 +967,8 @@ async function loadGraph() {
       Graph.cameraPosition({x:(match.x||0)*dr, y:(match.y||0)*dr, z:(match.z||0)*dr}, match, 800);
     }
     Graph.nodeColor(Graph.nodeColor());
+    Graph.linkColor(Graph.linkColor());
+    Graph.linkWidth(Graph.linkWidth());
   });
   makeAutocomplete(document.getElementById("path-from"), document.getElementById("path-from-ac"), () => {});
   makeAutocomplete(document.getElementById("path-to"), document.getElementById("path-to-ac"), () => {});
@@ -936,6 +978,8 @@ async function loadGraph() {
     highlightIds.clear();
     Graph.nodeColor(Graph.nodeColor());
     Graph.nodeVal(Graph.nodeVal());
+    Graph.linkColor(Graph.linkColor());
+    Graph.linkWidth(Graph.linkWidth());
   });
   wireClearBtn("path-from", "path-from-clear");
   wireClearBtn("path-to", "path-to-clear");
@@ -1227,6 +1271,12 @@ function resetPathIsolation() {
   btn.textContent = "Find path";
   btn.classList.remove("path-reset-mode");
   document.getElementById("path-result").textContent = "";
+  // clear the inputs and any extra node rows
+  document.getElementById("path-from").value = "";
+  document.getElementById("path-to").value = "";
+  document.getElementById("path-extra").innerHTML = "";
+  document.getElementById("path-from-clear").style.display = "none";
+  document.getElementById("path-to-clear").style.display = "none";
   applyFilters();
 }
 
@@ -1405,6 +1455,8 @@ function onNodeClick(node) {
   );
   Graph.nodeColor(Graph.nodeColor());
   Graph.nodeVal(Graph.nodeVal());
+  Graph.linkColor(Graph.linkColor());
+  Graph.linkWidth(Graph.linkWidth());
   showNodeDetailPanel(node);
 }
 
@@ -1535,12 +1587,21 @@ function communityTopNodes(cid, k) {
 // Relevant nodes for the question, with compact graph facts. Explicit @-mentions
 // come first, then the selected node, path, question matches — and, when a community
 // is isolated, its representative members (so "what's this community about" is grounded).
+// The node titles currently emphasized in the view — what the user means by
+// "highlighted" / "these nodes": the isolated path, else the click/search/overlay set.
+function highlightedNodeTitles() {
+  if (pathIsolationActive && currentPathChain.length) return currentPathChain.slice(0, 25);
+  if (highlightIds.size) return [...highlightIds].map(id => nodeById[id]?.title).filter(Boolean).slice(0, 25);
+  return [];
+}
+
 function buildRetrieval(question) {
   const picked = new Map();
   const add = n => { if (n && !picked.has(n.id)) picked.set(n.id, n); };
   mentionNodes.forEach(add);
   if (currentSelectedNode) add(currentSelectedNode);
   (currentPathChain || []).forEach(title => add(allNodes.find(n => n.title === title)));
+  if (!pathIsolationActive) [...highlightIds].forEach(id => add(nodeById[id]));  // click/search/overlay focus
   entityLink(question, 3).forEach(add);
   if (isolatedComm !== null) communityTopNodes(isolatedComm, 3).forEach(add);
   return [...picked.values()].slice(0, 4).map(n => ({
@@ -1579,6 +1640,7 @@ function buildCopilotContext(question) {
     } : null,
     retrieval: buildRetrieval(question),
     currentPath: currentPathChain,
+    highlightedNodes: highlightedNodeTitles(),
     activeFilters,
     colorMode,
     sizeMode,
@@ -1751,6 +1813,16 @@ function appendCopilotBubble(role, text, streaming, provider) {
   return el;
 }
 
+// A subtle inline note in the message stream (e.g. when the model returns no prose).
+function appendCopilotNote(text) {
+  const note = document.createElement("div");
+  note.className = "cop-note";
+  note.textContent = text;
+  const msgs = document.getElementById("cop-messages");
+  msgs.appendChild(note);
+  msgs.scrollTop = msgs.scrollHeight;
+}
+
 // Render a collapsed "Ran N tools" disclosure summarizing a batch of actions.
 function renderToolGroup(results) {
   if (!results.length) return;
@@ -1863,8 +1935,8 @@ async function executeActions(list) {
   for (const item of list) {
     if (!item || typeof item !== "object" || !item.action) continue;
     const entry = ACTION_CATALOG[item.action];
+    if (!entry) continue;   // silently drop hallucinated/invalid action names
     const label = describeAction(item.action, item.args);
-    if (!entry) { results.push({ ok: false, label: `Unknown action: ${item.action}` }); continue; }
     try {
       const res = await entry.run(item.args || {});
       const ok = res === true || (res && typeof res === "object" && res.ok);
@@ -1879,15 +1951,16 @@ async function executeActions(list) {
 
 // ─── Sentinel parsing (ACTIONS / SUGGESTIONS trailing lines) ──────────────────
 
-// Find a sentinel (ACTIONS / SUGGESTIONS), tolerating markdown wrappers (**, __,
-// `, #, >), any case, and inline placement. The label must be followed by a JSON
-// array, which we extract with string-aware bracket matching so brackets inside
-// strings don't end it early. Returns { labelStart, json } or null.
+// Extract the JSON value after a sentinel label (ACTIONS / SUGGESTIONS), tolerating
+// markdown wrappers and any case. Accepts either a JSON array `[…]` OR a stray object
+// `{…}` (some models emit one), with string-aware bracket matching. Returns the raw
+// json substring or null.
 function findSentinel(text, keyword) {
-  const re = new RegExp("[*_`#>\\-\\s]{0,6}\\b" + keyword + "\\b[*_`]*\\s*:?\\s*[*_`]*\\s*(\\[)", "i");
+  const re = new RegExp("[*_`#>\\-\\s]{0,6}\\b" + keyword + "\\b[*_`]*\\s*:?\\s*[*_`]*\\s*([\\[{])", "i");
   const m = re.exec(text);
   if (!m) return null;
-  const start = m.index + m[0].length - 1;   // index of the opening '['
+  const open = m[1], close = open === "[" ? "]" : "}";
+  const start = m.index + m[0].length - 1;   // index of the opener
   let depth = 0, inStr = false, esc = false, end = -1;
   for (let i = start; i < text.length; i++) {
     const ch = text[i];
@@ -1896,28 +1969,26 @@ function findSentinel(text, keyword) {
       else if (ch === "\\") esc = true;
       else if (ch === '"') inStr = false;
     } else if (ch === '"') inStr = true;
-    else if (ch === "[") depth++;
-    else if (ch === "]" && --depth === 0) { end = i; break; }
+    else if (ch === open) depth++;
+    else if (ch === close && --depth === 0) { end = i; break; }
   }
-  if (end < 0) return null;
-  return { labelStart: m.index, json: text.slice(start, end + 1) };
+  return end < 0 ? null : { json: text.slice(start, end + 1) };
 }
 
-// Strip any sentinel tail from text being shown (also catches a not-yet-closed
-// array during streaming, so the raw label never flashes in the bubble).
+// Strip the sentinel tail from displayed text. Cuts at the ACTIONS:/SUGGESTIONS:
+// LABEL regardless of what follows ([, {, or malformed) — so a malformed directive
+// never leaks into the visible message. (Also hides a not-yet-closed array mid-stream.)
 function stripSentinels(text) {
-  const m = text.match(/[*_`#>\-\s]{0,6}\b(?:ACTIONS|SUGGESTIONS)\b[*_`]*\s*:?\s*[*_`]*\s*\[/i);
+  const m = text.match(/\n?[ \t]*[*_`#>\-]{0,3}[ \t]*\b(?:ACTIONS|SUGGESTIONS)\b[ \t]*[*_`]*[ \t]*:/i);
   return (m ? text.slice(0, m.index) : text).trim();
 }
 
 function parseSentinels(text) {
-  const out = { prose: "", actions: null, suggestions: null };
-  let cut = text.length;
+  const out = { prose: stripSentinels(text), actions: null, suggestions: null };
   const act = findSentinel(text, "ACTIONS");
-  if (act) { cut = Math.min(cut, act.labelStart); try { out.actions = JSON.parse(act.json); } catch(_) {} }
+  if (act) { try { const v = JSON.parse(act.json); out.actions = Array.isArray(v) ? v : [v]; } catch(_) {} }
   const sug = findSentinel(text, "SUGGESTIONS");
-  if (sug) { cut = Math.min(cut, sug.labelStart); try { out.suggestions = JSON.parse(sug.json); } catch(_) {} }
-  out.prose = text.slice(0, cut).trim();
+  if (sug) { try { const v = JSON.parse(sug.json); out.suggestions = Array.isArray(v) ? v.filter(x => typeof x === "string") : []; } catch(_) {} }
   return out;
 }
 
@@ -1944,8 +2015,9 @@ async function sendCopilotMessage(text) {
   if (!convo) return;
 
   copilotStreaming = true;
+  copilotAbort = new AbortController();
   const inputEl = document.getElementById("cop-input");
-  document.getElementById("cop-send").disabled = true;
+  setSendButton("stop");
   inputEl.value = "";
   autoGrowInput();
   document.getElementById("cop-suggestions").innerHTML = "";
@@ -1979,6 +2051,7 @@ async function sendCopilotMessage(text) {
         context: requestContext,
         provider: copilotProvider,
       }),
+      signal: copilotAbort.signal,
     });
 
     if (!res.ok) {
@@ -1999,22 +2072,62 @@ async function sendCopilotMessage(text) {
 
     const parsed = parseSentinels(fullText);
     assistantBubble.classList.remove("cop-msg-streaming");
-    await renderAssistantMarkdown(textEl, parsed.prose);
+    const prose = (parsed.prose || "").trim();
 
-    convo.messages.push({ role: "assistant", content: parsed.prose, provider: msgProvider });
-    convo.updatedAt = Date.now();
-    saveConvos();
+    if (prose) {
+      await renderAssistantMarkdown(textEl, prose);
+      convo.messages.push({ role: "assistant", content: prose, provider: msgProvider });
+      convo.updatedAt = Date.now();
+      saveConvos();
+    } else {
+      // no prose returned — drop the empty bubble; the tool group (if any) is the
+      // feedback, otherwise leave an explicit note so it never looks like a hang
+      assistantBubble.remove();
+      if (!parsed.actions || !parsed.actions.length) {
+        appendCopilotNote("No reply text returned — try rephrasing.");
+      }
+    }
 
     if (parsed.actions) await executeActions(parsed.actions);
     if (parsed.suggestions) renderSuggestionChips(parsed.suggestions);
 
   } catch (err) {
-    assistantBubble.remove();
-    showDisconnectionBubble(err);
+    if (err.name === "AbortError") {
+      // user pressed Stop — keep whatever streamed so far
+      const partial = stripSentinels(fullText).trim();
+      if (partial) {
+        await renderAssistantMarkdown(textEl, partial);
+        convo.messages.push({ role: "assistant", content: partial, provider: msgProvider });
+        convo.updatedAt = Date.now();
+        saveConvos();
+      } else {
+        assistantBubble.remove();
+      }
+      appendCopilotNote("Stopped.");
+    } else {
+      assistantBubble.remove();
+      showDisconnectionBubble(err);
+    }
   } finally {
     copilotStreaming = false;
-    document.getElementById("cop-send").disabled = false;
+    copilotAbort = null;
+    setSendButton("send");
     inputEl.focus();
+  }
+}
+
+// Toggle the send button between Send (↑) and Stop (■) states.
+function setSendButton(mode) {
+  const btn = document.getElementById("cop-send");
+  btn.disabled = false;
+  if (mode === "stop") {
+    btn.textContent = "■";
+    btn.title = "Stop generating";
+    btn.classList.add("stop");
+  } else {
+    btn.textContent = "↑";
+    btn.title = "Send (Enter · Shift+Enter for newline)";
+    btn.classList.remove("stop");
   }
 }
 
@@ -2152,6 +2265,7 @@ function pickMention(idx) {
 
 const copInput = document.getElementById("cop-input");
 document.getElementById("cop-send").addEventListener("click", () => {
+  if (copilotStreaming) { copilotAbort?.abort(); return; }   // Stop
   const text = copInput.value.trim();
   if (text) sendCopilotMessage(text);
 });
