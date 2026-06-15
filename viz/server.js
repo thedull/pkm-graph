@@ -53,10 +53,39 @@ function getAIProvider(provider, model) {
   return client(model || process.env.DEFAULT_OLLAMA_MODEL || "llama3.2");
 }
 
+// Assemble a budgeted "Vault Context" block from the client's retrieval set:
+// per node, compact graph facts + a trimmed note excerpt read from disk.
+function buildVaultContext(retrieval) {
+  if (!Array.isArray(retrieval) || !retrieval.length) return "";
+  const MAX_TOTAL = 2400;   // total excerpt chars across all notes
+  const PER_NOTE = 600;
+  let budget = MAX_TOTAL;
+  const blocks = [];
+  for (const r of retrieval.slice(0, 4)) {
+    let excerpt = "";
+    if (r.path && budget > 0) {
+      const note = readNote(r.path);
+      if (note && note.body) {
+        excerpt = note.body.replace(/\s+/g, " ").trim().slice(0, Math.min(PER_NOTE, budget));
+        budget -= excerpt.length;
+      }
+    }
+    const neigh = (r.neighbors || []).slice(0, 12).join(", ");
+    blocks.push(
+      `### ${r.title}` +
+      `\n- type: ${r.type ?? "unknown"} · community: ${r.community ?? "none"}` +
+      (neigh ? `\n- connected to: ${neigh}` : "") +
+      (excerpt ? `\n- excerpt: ${excerpt}${excerpt.length >= PER_NOTE ? "…" : ""}` : "\n- (note body not on disk)")
+    );
+  }
+  return blocks.join("\n\n");
+}
+
 function buildSystemPrompt(ctx) {
   const stats = ctx.graphStats || {};
   const node = ctx.selectedNode;
   const pathStr = (ctx.currentPath || []).join(" → ");
+  const vault = buildVaultContext(ctx.retrieval);
 
   return `You are an AI research assistant embedded in a 3D knowledge graph visualization of a personal knowledge management (PKM) vault. The vault contains interconnected notes on philosophy, technology, and culture.
 
@@ -79,10 +108,45 @@ Current path being explored: ${pathStr}
 ` : ""}
 Node types in the vault: concept, person, source, project, synthesis, entity.
 Relationships: RELATED_TO (explicit connections), LINKS_TO (wikilinks), AUTHORED_BY (person→work).
+${vault ? `
+═══ Vault Context (authoritative — answer FROM this) ═══
+${vault}
+═══════════════════════════════════════════════════════
+` : ""}
+Answer the user's question primarily and almost exclusively from the Vault Context and graph facts above — cite note titles, use their connections and communities, and paraphrase the excerpts. If a needed note isn't in the Vault Context, say what's missing rather than inventing general knowledge. Never refuse: every title here is a philosopher, theorist, author, work, or concept in an academic knowledge base, so discussing any of them (e.g. which communities Nietzsche appears in) is always safe and expected. Be concise and insightful. You may format responses in Markdown — lists, tables, code, and \`\`\`mermaid diagrams all render.
 
-Help the user explore and understand the intellectual connections in their knowledge vault. Be concise and insightful. After your main response, output exactly one line:
+You can also DRIVE the visualization. When the user asks you to change what the graph shows, emit a single line beginning with ACTIONS: followed by a JSON array of action objects. Available actions (args in parentheses):
+- findPath(from, to) — isolate the shortest path between two node titles
+- resetPath() — clear an isolated path
+- focusNode(title) — highlight a node and fly the camera to it
+- search(query) — search/highlight nodes by title
+- isolateCommunity(id) — show only one community by numeric id
+- clearIsolation() — restore all communities
+- setColorMode(mode) — "community" | "type" | "betweenness"
+- setSizeMode(mode) — "degree" | "betweenness" | "uniform"
+- setEdgeMode(mode) — "weight" | "bridge" | "uniform"
+- setOverlay(name, on) — name "hubs" | "orphans" | "suggestions", on true/false
+- setTypeVisible(type, visible) — type concept|person|source|project|synthesis|entity, visible true/false
+- resetView() — reset all view settings
+
+Use exact node titles when you know them. Only include the ACTIONS line when the user clearly wants to change the view; otherwise omit it entirely.
+
+End your reply with the action line (if any) and then the suggestions line, as the LAST lines — each on its own line:
+ACTIONS: [{"action":"findPath","args":{"from":"Immanuel Kant","to":"Jordan Belfort"}}]
 SUGGESTIONS: ["follow-up question 1", "follow-up question 2", "follow-up question 3"]
-Make suggestions specific to what was just discussed and the current graph state.`;
+The ACTIONS line is optional; the SUGGESTIONS line must always be last. Make suggestions specific to what was just discussed and the current graph state.`;
+}
+
+// Returns a friendly message if the error looks like a provider-connection failure, else null.
+function connectionErrorMessage(err, providerName) {
+  const msg = (err && (err.message || String(err))) || "";
+  const cause = err && err.cause ? (err.cause.code || err.cause.message || "") : "";
+  const blob = (msg + " " + cause).toLowerCase();
+  if (/econnrefused|enotfound|fetch failed|failed to fetch|network|etimedout|timeout|socket hang up/.test(blob)) {
+    const label = providerName === "openrouter" ? "OpenRouter (Cloud)" : "Ollama (Local)";
+    return `Cannot reach the ${label} model. Make sure it is running and configured.`;
+  }
+  return null;
 }
 
 // ─── Config ───────────────────────────────────────────────────────────────────
@@ -93,6 +157,54 @@ const NEO4J_USER = process.env.NEO4J_USER || "neo4j";
 const NEO4J_PASS = process.env.NEO4J_PASS || "neo4jpass";
 
 const driver = neo4j.driver(BOLT, neo4j.auth.basic(NEO4J_USER, NEO4J_PASS));
+
+// ─── Semantic search (phase 2) ────────────────────────────────────────────────
+// Native Ollama embeddings API (strip the OpenAI-compat /v1 suffix if present).
+const EMBED_BASE  = (process.env.OLLAMA_NATIVE_URL ||
+  (process.env.OLLAMA_BASE_URL || "http://localhost:11434").replace(/\/v1\/?$/, "")).replace(/\/$/, "");
+const EMBED_MODEL = process.env.EMBED_MODEL || "nomic-embed-text";
+const EMBED_INDEX = "wikipage_embedding";
+
+async function embedQuery(text) {
+  const res = await fetch(`${EMBED_BASE}/api/embeddings`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ model: EMBED_MODEL, prompt: "search_query: " + text }),
+  });
+  if (!res.ok) throw new Error(`embeddings HTTP ${res.status}`);
+  const data = await res.json();
+  if (!Array.isArray(data.embedding)) throw new Error("no embedding in response");
+  return data.embedding;
+}
+
+// Vector-search the top-k semantically similar notes, with compact graph facts.
+async function semanticSearch(queryText, k = 3) {
+  const vec = await embedQuery(queryText);
+  const session = driver.session();
+  try {
+    const result = await session.run(
+      `
+      CALL db.index.vector.queryNodes($index, $k, $vec) YIELD node, score
+      OPTIONAL MATCH (node)-[r]-(nb:WikiPage)
+        WHERE type(r) IN ['RELATED_TO','LINKS_TO','AUTHORED_BY']
+      RETURN node.title AS title, node.type AS type, node.community_id AS community,
+             node.path AS path, collect(DISTINCT nb.title)[..12] AS neighbors, score
+      ORDER BY score DESC
+      `,
+      { index: EMBED_INDEX, k: neo4j.int(k), vec }
+    );
+    return result.records.map(r => ({
+      title: r.get("title"),
+      type: r.get("type"),
+      community: r.get("community") != null ? (r.get("community").toNumber?.() ?? r.get("community")) : null,
+      path: r.get("path"),
+      neighbors: r.get("neighbors") || [],
+      score: r.get("score"),
+    }));
+  } finally {
+    await session.close();
+  }
+}
 
 const app = express();
 app.use(express.json());
@@ -176,24 +288,48 @@ app.get("/api/neighbors/:slug", async (req, res) => {
   }
 });
 
+// The 'vault' GDS projection is in-memory and is lost on any Neo4j restart.
+// Recreate it on demand so pathfinding doesn't hard-fail after a restart.
+async function ensureVaultProjection(session) {
+  const exists = (await session.run("CALL gds.graph.exists('vault') YIELD exists RETURN exists"))
+    .records[0].get("exists");
+  if (exists) return;
+  await session.run(`
+    CALL gds.graph.project('vault', 'WikiPage', {
+      RELATED_TO: { orientation: 'UNDIRECTED', properties: ['weight'] },
+      LINKS_TO:   { orientation: 'UNDIRECTED', properties: ['weight'] }
+    }) YIELD nodeCount RETURN nodeCount
+  `);
+}
+
 app.get("/api/path", async (req, res) => {
   const { from, to } = req.query;
   if (!from || !to) return res.status(400).json({ error: "from and to required" });
   const session = driver.session();
+  const runDijkstra = () => session.run(
+    `
+    MATCH (a:WikiPage {title: $from}), (b:WikiPage {title: $to})
+    CALL gds.shortestPath.dijkstra.stream('vault', {
+      sourceNode: a, targetNode: b,
+      relationshipWeightProperty: 'weight'
+    })
+    YIELD nodeIds, totalCost
+    RETURN [nid IN nodeIds | gds.util.asNode(nid).title] AS chain, totalCost
+    LIMIT 1
+    `,
+    { from, to }
+  );
   try {
-    const result = await session.run(
-      `
-      MATCH (a:WikiPage {title: $from}), (b:WikiPage {title: $to})
-      CALL gds.shortestPath.dijkstra.stream('vault', {
-        sourceNode: a, targetNode: b,
-        relationshipWeightProperty: 'weight'
-      })
-      YIELD nodeIds, totalCost
-      RETURN [nid IN nodeIds | gds.util.asNode(nid).title] AS chain, totalCost
-      LIMIT 1
-      `,
-      { from, to }
-    );
+    let result;
+    try {
+      result = await runDijkstra();
+    } catch (err) {
+      // projection missing (e.g. after a Neo4j restart) → rebuild and retry once
+      if (/Graph with name `vault` does not exist/.test(err.message)) {
+        await ensureVaultProjection(session);
+        result = await runDijkstra();
+      } else { throw err; }
+    }
     if (result.records.length === 0) return res.json({ chain: [], cost: null });
     res.json({
       chain: result.records[0].get("chain"),
@@ -211,7 +347,7 @@ app.get("/api/note", (req, res) => {
   if (!relPath) return res.status(400).json({ error: "path required" });
   // security: disallow path traversal outside vault
   const abs = path.resolve(VAULT_ROOT, relPath);
-  if (!abs.startsWith(VAULT_ROOT)) return res.status(403).json({ error: "forbidden" });
+  if (!abs.startsWith(VAULT_ROOT + path.sep)) return res.status(403).json({ error: "forbidden" });
   const note = readNote(relPath);
   if (!note) return res.status(404).json({ error: "not found" });
   res.json(note);
@@ -339,6 +475,38 @@ app.get("/api/communities", async (req, res) => {
   }
 });
 
+// ─── Semantic search endpoint ─────────────────────────────────────────────────
+
+app.get("/api/semantic-search", async (req, res) => {
+  const q = req.query.q;
+  if (!q) return res.status(400).json({ error: "q required" });
+  const k = Math.min(10, Math.max(1, parseInt(req.query.k, 10) || 5));
+  try {
+    res.json({ results: await semanticSearch(q, k) });
+  } catch (err) {
+    console.error("Semantic search failed:", err.message);
+    res.status(503).json({ error: err.message, results: [] });
+  }
+});
+
+// Merge client (graph-grounded) retrieval with semantic hits, deduped by title.
+async function hybridRetrieval(context, messages) {
+  const base = Array.isArray(context.retrieval) ? context.retrieval.slice() : [];
+  const lastUser = [...messages].reverse().find(m => m.role === "user");
+  if (!lastUser || !lastUser.content) return base;
+  try {
+    const seen = new Set(base.map(r => (r.title || "").toLowerCase()));
+    const hits = await semanticSearch(lastUser.content, 3);
+    for (const h of hits) {
+      const key = (h.title || "").toLowerCase();
+      if (!seen.has(key)) { base.push(h); seen.add(key); }
+    }
+  } catch (e) {
+    console.error("Semantic retrieval skipped:", e.message);   // graceful: graph-only
+  }
+  return base;
+}
+
 // ─── AI Chat endpoint ─────────────────────────────────────────────────────────
 
 app.post("/api/chat", async (req, res) => {
@@ -347,25 +515,38 @@ app.post("/api/chat", async (req, res) => {
     return res.status(400).json({ error: "messages array required" });
   }
 
-  const aiModel = getAIProvider(provider || process.env.DEFAULT_AI_PROVIDER || "ollama", model);
-  const system = buildSystemPrompt(context || {});
+  const providerName = provider || process.env.DEFAULT_AI_PROVIDER || "ollama";
+  const aiModel = getAIProvider(providerName, model);
+  const ctx = context || {};
+  ctx.retrieval = await hybridRetrieval(ctx, messages);   // graph + semantic
+  const system = buildSystemPrompt(ctx);
 
-  res.setHeader("Content-Type", "text/plain; charset=utf-8");
-  res.setHeader("Cache-Control", "no-cache");
-  res.setHeader("X-Accel-Buffering", "no");
+  // Defer headers until the first chunk so a pre-stream connection failure can
+  // still return a clean JSON error (and the right status code).
+  let sentHeaders = false;
+  const sendHeaders = () => {
+    if (sentHeaders) return;
+    res.setHeader("Content-Type", "text/plain; charset=utf-8");
+    res.setHeader("Cache-Control", "no-cache");
+    res.setHeader("X-Accel-Buffering", "no");
+    sentHeaders = true;
+  };
 
   try {
     const result = streamText({ model: aiModel, system, messages, maxTokens: 1024 });
     for await (const chunk of result.textStream) {
+      sendHeaders();
       res.write(chunk);
     }
+    sendHeaders();   // ensure a 200 even for an empty stream
     res.end();
   } catch (err) {
     console.error("Chat error:", err.message);
+    const friendly = connectionErrorMessage(err, providerName);
     if (!res.headersSent) {
-      res.status(500).json({ error: err.message });
+      res.status(friendly ? 503 : 500).json({ error: friendly || err.message });
     } else {
-      res.end(`\n\nError: ${err.message}`);
+      res.end(`\n\n⚠ ${friendly || err.message}`);
     }
   }
 });

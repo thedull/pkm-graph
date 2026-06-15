@@ -1,0 +1,22 @@
+# .graphignore — notes excluded from the knowledge graph (gitignore-style).
+# Patterns match note paths relative to the vault root. Blank lines and '#' comments
+# are ignored. A trailing "/" matches a directory (and everything under it); "**/" means
+# "in any directory". Bare names match by filename anywhere in the vault.
+
+# ── Dependency / build junk accidentally ingested ─────────────────────────────
+**/node_modules/
+
+# ── The extracted graph project itself (files moved out to pkm-graph/) ────────
+wiki/projects/pkm-evolution/graph/
+
+# ── Generated discovery reports (deliverables, not graph nodes) ───────────────
+**/Graph Discovery Report*.md
+
+# ── Generated artifacts & raw captures ────────────────────────────────────────
+wiki/artifacts/
+wiki/artifact/
+**/raw/
+
+# ── Maintenance / pipeline notes ──────────────────────────────────────────────
+ingest-queue.md
+**/Ingest Queue.md

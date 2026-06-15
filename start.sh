@@ -11,8 +11,13 @@ export VAULT_ROOT
 VIZ_DIR="$SCRIPT_DIR/viz"
 BOLT="bolt://localhost:7687"
 NEO4J_HTTP="http://localhost:7474"
-VIZ_PORT=3000
+# Port the viz server listens on — honor PORT from the env or viz/.env (default 3000),
+# so start.sh checks/opens the same port server.js binds.
+VIZ_PORT="${PORT:-$(grep -E '^PORT=' "$VIZ_DIR/.env" 2>/dev/null | tail -1 | cut -d= -f2 | tr -d '[:space:]')}"
+VIZ_PORT="${VIZ_PORT:-3000}"
 CONTAINER_NAME="pkm-graph"
+EMBED_MODEL="${EMBED_MODEL:-nomic-embed-text}"
+OLLAMA_HTTP="${OLLAMA_NATIVE_URL:-http://localhost:11434}"
 
 log()  { echo "  $*"; }
 ok()   { echo "✓ $*"; }
@@ -97,7 +102,25 @@ else
   ok "Installed"
 fi
 
-# ── 3. Sync vault → Neo4j ────────────────────────────────────────────────────
+# ── 3. Embedding model (for Copilot semantic search) ─────────────────────────
+step "Embedding model"
+
+if command -v ollama &>/dev/null; then
+  if ollama list 2>/dev/null | grep -q "^${EMBED_MODEL}"; then
+    ok "Embedding model '${EMBED_MODEL}' already present"
+  else
+    log "Pulling embedding model '${EMBED_MODEL}' (one-time, ~274MB)..."
+    if ollama pull "${EMBED_MODEL}" >/dev/null 2>&1; then
+      ok "Embedding model ready"
+    else
+      warn "Could not pull '${EMBED_MODEL}' — semantic search will be skipped (Copilot still works)"
+    fi
+  fi
+else
+  warn "Ollama not found — skipping embeddings (Copilot semantic search disabled)"
+fi
+
+# ── 4. Sync vault → Neo4j (nodes, edges, embeddings) ─────────────────────────
 step "Vault sync"
 
 cd "$VAULT_ROOT"
@@ -106,7 +129,16 @@ cd "$VAULT_ROOT"
   --bolt "$BOLT" \
   --auth neo4j:neo4jpass
 
-# ── 4. Viz server ─────────────────────────────────────────────────────────────
+# ── 5. Graph analytics (communities, centrality, pathfinding projection) ─────
+step "Graph analytics"
+
+if "$PYTHON" "$SCRIPT_DIR/sync.py" --vault . --bolt "$BOLT" --auth neo4j:neo4jpass --gds; then
+  ok "Communities, centrality & pathfinding ready"
+else
+  warn "Graph analytics step failed — the server will rebuild the projection on demand"
+fi
+
+# ── 6. Viz server ─────────────────────────────────────────────────────────────
 step "Visualization server"
 
 if curl -sf "http://localhost:${VIZ_PORT}" > /dev/null 2>&1; then

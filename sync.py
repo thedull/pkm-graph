@@ -9,17 +9,28 @@ Modes:
 """
 
 import argparse
+import fnmatch
 import json
 import os
 import pathlib
 import re
 import sys
 import time
+import urllib.request
+import urllib.error
 from datetime import date
 from typing import Dict, List, Optional
 
 import frontmatter
 from neo4j import GraphDatabase
+
+# ── Semantic embeddings (phase 2) ──────────────────────────────────────────────
+# Ollama native API (no /v1); model produces 768-dim vectors for nomic-embed-text.
+EMBED_BASE   = os.environ.get("OLLAMA_NATIVE_URL", "http://localhost:11434").rstrip("/")
+EMBED_MODEL  = os.environ.get("EMBED_MODEL", "nomic-embed-text")
+EMBED_DIMS   = int(os.environ.get("EMBED_DIMS", "768"))
+EMBED_INDEX  = "wikipage_embedding"
+EMBED_MAX_CHARS = 2000   # truncate note body before embedding
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -41,11 +52,10 @@ TYPE_TO_LABEL = {
 GRAPH_NAME = "vault"
 
 # GDS pathfinding pairs (source title → target title)
-PATHFINDING_PAIRS = [
-    ("Michel Foucault", "AI Alignment"),
-    ("Jürgen Habermas", "Context Engineering"),
-    ("Martin Heidegger", "Node2Vec"),
-]
+# Load from pathfinding.json (gitignored) so personal vault content stays out of the repo.
+# Copy pathfinding.example.json → pathfinding.json and fill in your own node titles.
+_pairs_path = pathlib.Path(__file__).parent / "pathfinding.json"
+PATHFINDING_PAIRS = json.load(open(_pairs_path)) if _pairs_path.exists() else []
 
 
 # ---------------------------------------------------------------------------
@@ -110,12 +120,58 @@ def parse_note(path: pathlib.Path, vault_root: pathlib.Path) -> dict:
         "entity_type":   str(meta.get("entity_type") or ""),
         "fm_links":      fm_links,
         "body_links":    body_links,
+        "body":          body,
     }
 
 
-def collect_notes(wiki_dir: pathlib.Path, vault_root: pathlib.Path) -> List[dict]:
+# ---------------------------------------------------------------------------
+# .graphignore (gitignore-style exclusions)
+# ---------------------------------------------------------------------------
+
+def load_graphignore(path: pathlib.Path) -> List[str]:
+    """Read .graphignore patterns (skipping blanks and # comments)."""
+    if not path.exists():
+        return []
+    pats = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if line and not line.startswith("#"):
+            pats.append(line)
+    return pats
+
+
+def is_ignored(relpath: str, patterns: List[str]) -> bool:
+    """Match a vault-relative note path against .graphignore patterns."""
+    rp = relpath.replace(os.sep, "/")
+    segs = rp.split("/")
+    base = segs[-1]
+    for pat in patterns:
+        if pat.endswith("/"):                          # directory pattern
+            d = pat.rstrip("/")
+            d = d[3:] if d.startswith("**/") else d
+            if "/" not in d:                           # bare dir name → any segment
+                if d in segs:
+                    return True
+            elif rp == d or rp.startswith(d + "/"):    # anchored dir prefix
+                return True
+        else:                                          # file/glob pattern
+            p = pat[3:] if pat.startswith("**/") else pat
+            if "/" in p:
+                if fnmatch.fnmatch(rp, p) or fnmatch.fnmatch(rp, "*/" + p):
+                    return True
+            elif fnmatch.fnmatch(base, p):
+                return True
+    return False
+
+
+def collect_notes(wiki_dir: pathlib.Path, vault_root: pathlib.Path,
+                  ignore: Optional[List[str]] = None) -> List[dict]:
+    ignore = ignore or []
     notes = []
     for md_file in wiki_dir.rglob("*.md"):
+        rel = str(md_file.relative_to(vault_root))
+        if is_ignored(rel, ignore):
+            continue
         note = parse_note(md_file, vault_root)
         if note:
             notes.append(note)
@@ -247,6 +303,85 @@ def upsert_edges(session, notes: List[dict], slug_index: Dict, verbose: bool):
                 counts["AUTHORED_BY"] += 1
 
     return counts
+
+
+# ---------------------------------------------------------------------------
+# Semantic embeddings (Ollama) + Neo4j vector index
+# ---------------------------------------------------------------------------
+
+def ollama_embed(text: str, prefix: str = "search_document: ", quiet: bool = False) -> Optional[List[float]]:
+    """Embed text via the Ollama native API. Returns a vector or None on failure."""
+    payload = json.dumps({"model": EMBED_MODEL, "prompt": prefix + text}).encode("utf-8")
+    req = urllib.request.Request(
+        f"{EMBED_BASE}/api/embeddings", data=payload,
+        headers={"Content-Type": "application/json"}, method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            data = json.loads(resp.read())
+        vec = data.get("embedding")
+        return vec if isinstance(vec, list) and vec else None
+    except (urllib.error.URLError, TimeoutError, ValueError) as e:
+        if not quiet:
+            print(f"  WARN: embedding failed: {e}", file=sys.stderr)
+        return None
+
+
+def ensure_vector_index(session, verbose: bool):
+    # Neo4j 5.14 uses the procedure form (the CREATE VECTOR INDEX syntax is 5.15+).
+    names = [r["name"] for r in session.run("SHOW INDEXES YIELD name RETURN name")]
+    if EMBED_INDEX in names:
+        if verbose:
+            print(f"  Vector index '{EMBED_INDEX}' already exists")
+        return
+    session.run(
+        "CALL db.index.vector.createNodeIndex($name, 'WikiPage', 'text_embedding', $dims, 'cosine')",
+        name=EMBED_INDEX, dims=EMBED_DIMS,
+    )
+    if verbose:
+        print(f"  Vector index '{EMBED_INDEX}' created ({EMBED_DIMS}-dim, cosine)")
+
+
+def embed_notes(session, notes: List[dict], verbose: bool) -> int:
+    """Embed each note's title+body and store as n.text_embedding. Returns count written."""
+    # one quiet health check so a missing model doesn't spam a warning per note
+    if ollama_embed("ping", quiet=True) is None:
+        print(f"  Embedding model '{EMBED_MODEL}' unavailable at {EMBED_BASE} — skipping "
+              f"(run: ollama pull {EMBED_MODEL})", file=sys.stderr)
+        return 0
+    written = 0
+    for i, note in enumerate(notes, 1):
+        body = (note.get("body") or "").strip()
+        text = f"{note['title']}\n{body}"[:EMBED_MAX_CHARS]
+        vec = ollama_embed(text)
+        if not vec:
+            continue
+        session.run(
+            "MATCH (n:WikiPage {slug: $slug}) SET n.text_embedding = $vec",
+            slug=note["slug"], vec=vec,
+        )
+        written += 1
+        if verbose or i % 50 == 0:
+            print(f"  embedded {i}/{len(notes)}", file=sys.stderr)
+    return written
+
+
+# ---------------------------------------------------------------------------
+# Prune (remove ignored / stale nodes)
+# ---------------------------------------------------------------------------
+
+def prune_graph(session, vault_root: pathlib.Path, patterns: List[str], verbose: bool) -> List[str]:
+    """Delete nodes whose file is .graphignore'd or no longer exists on disk."""
+    rows = [(r["slug"], r["path"]) for r in
+            session.run("MATCH (n:WikiPage) WHERE n.path IS NOT NULL RETURN n.slug AS slug, n.path AS path")]
+    removed = []
+    for slug, path in rows:
+        if is_ignored(path, patterns) or not (vault_root / path).exists():
+            session.run("MATCH (n:WikiPage {slug: $slug}) DETACH DELETE n", slug=slug)
+            removed.append(path)
+            if verbose:
+                print(f"  pruned {path}", file=sys.stderr)
+    return removed
 
 
 # ---------------------------------------------------------------------------
@@ -534,7 +669,7 @@ def write_discovery_report(vault_root: pathlib.Path, discovery: dict):
     # Build related: list from top 5 hubs
     related_list = "\n".join(f'  - "[[{h["title"]}]]"' for h in hubs[:5])
 
-    report_path = vault_root / "wiki" / "synthesis" / f"Graph Discovery Report {today}.md"
+    report_path = vault_root / "wiki" / "artifact" / f"Graph Discovery Report {today}.md"
 
     lines = [
         "---",
@@ -698,11 +833,16 @@ def main():
     parser.add_argument("--verbose", "-v", action="store_true")
     parser.add_argument("--project-only", action="store_true", help="Only re-project GDS graph")
     parser.add_argument("--discover-only", action="store_true", help="Run GDS algorithms and write discovery report")
+    parser.add_argument("--embed-only", action="store_true", help="(Re)embed all notes and ensure the vector index")
+    parser.add_argument("--no-embed", action="store_true", help="Skip embedding during full sync")
+    parser.add_argument("--gds", action="store_true", help="Recreate the GDS projection + community/betweenness/degree (no report)")
+    parser.add_argument("--prune", action="store_true", help="Remove nodes that are .graphignore'd or missing on disk")
     args = parser.parse_args()
 
     vault_root = pathlib.Path(args.vault).resolve()
     wiki_dir = vault_root / "wiki"
     state_path = pathlib.Path(__file__).parent / ".sync-state.json"
+    ignore_patterns = load_graphignore(pathlib.Path(__file__).parent / ".graphignore")
 
     user, password = args.auth.split(":", 1)
     driver = GraphDatabase.driver(args.bolt, auth=(user, password))
@@ -718,6 +858,38 @@ def main():
         if args.project_only:
             drop_and_project(session, args.verbose)
             print("GDS projection recreated.")
+            driver.close()
+            return
+
+        if args.prune:
+            print("Pruning ignored / missing nodes...", file=sys.stderr)
+            removed = prune_graph(session, vault_root, ignore_patterns, args.verbose)
+            print(f"Pruned {len(removed)} node(s).")
+            if removed and not args.verbose:
+                for p in removed[:10]:
+                    print(f"  - {p}")
+                if len(removed) > 10:
+                    print(f"  … and {len(removed) - 10} more")
+            driver.close()
+            return
+
+        if args.embed_only:
+            print("Embedding all notes...", file=sys.stderr)
+            ensure_vector_index(session, args.verbose)
+            notes = collect_notes(wiki_dir, vault_root, ignore_patterns)
+            n = embed_notes(session, notes, args.verbose)
+            print(f"Embedded {n}/{len(notes)} notes into '{EMBED_INDEX}'.")
+            driver.close()
+            return
+
+        if args.gds:
+            print("Running GDS (projection + community/betweenness/degree)...", file=sys.stderr)
+            drop_and_project(session, args.verbose)
+            cc = run_leiden(session, args.verbose)
+            run_betweenness(session, args.verbose)
+            run_degree(session, args.verbose)
+            run_wcc(session, args.verbose)
+            print(f"GDS complete: {cc} communities, projection 'vault' ready.")
             driver.close()
             return
 
@@ -760,8 +932,13 @@ def main():
 
         # --- Full sync ---
         print(f"Collecting notes from {wiki_dir}...", file=sys.stderr if not args.verbose else sys.stderr)
-        notes = collect_notes(wiki_dir, vault_root)
+        notes = collect_notes(wiki_dir, vault_root, ignore_patterns)
         slug_index = build_slug_index(notes)
+
+        # remove nodes for files that are now ignored or gone (every sync, self-healing)
+        removed = prune_graph(session, vault_root, ignore_patterns, args.verbose)
+        if removed:
+            print(f"  pruned {len(removed)} ignored/stale node(s)")
 
         sync_state = load_sync_state(state_path)
         new_state = {}
@@ -788,6 +965,12 @@ def main():
 
         print("Upserting edges...")
         edge_counts = upsert_edges(session, changed_notes, slug_index, args.verbose)
+
+        if not args.no_embed:
+            print(f"Embedding {len(changed_notes)} changed notes...")
+            ensure_vector_index(session, args.verbose)
+            embedded = embed_notes(session, changed_notes, args.verbose)
+            print(f"  {embedded}/{len(changed_notes)} embedded")
 
         save_sync_state(state_path, new_state)
 
