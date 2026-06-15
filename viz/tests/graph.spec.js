@@ -289,6 +289,21 @@ test.describe("Node detail panel", () => {
     await expect(page.locator("#node-detail-panel")).not.toHaveClass(/open/);
   });
 
+  test("wikilink opens the node panel without touching the search box", async ({ page }) => {
+    await page.goto("/");
+    await page.waitForSelector("canvas", { timeout: 15000 });
+    await page.waitForFunction(() => typeof allNodes !== "undefined" && allNodes.length > 0, { timeout: 10000 });
+
+    await page.fill("#search", "preexisting search text");
+    const title = await page.evaluate(() => allNodes[0].title);
+    await page.evaluate(t => window.openNoteFromWikilink(t), title);
+
+    await expect(page.locator("#node-detail-panel")).toHaveClass(/open/);
+    await expect(page.locator("#ndp-title")).not.toBeEmpty();
+    // search box is left untouched
+    await expect(page.locator("#search")).toHaveValue("preexisting search text");
+  });
+
   test("Escape key hides the panel", async ({ page }) => {
     await page.goto("/");
     await page.waitForSelector("canvas", { timeout: 15000 });
@@ -611,6 +626,28 @@ test.describe("Copilot panel", () => {
     expect(await page.evaluate(() => mentionNodes.length)).toBeGreaterThan(0);
   });
 
+  test("isolating a community feeds it to the Copilot context", async ({ page }) => {
+    let captured = null;
+    await page.route("**/api/chat", async route => {
+      captured = route.request().postDataJSON();
+      await route.fulfill({ status: 200, headers: { "Content-Type": "text/plain; charset=utf-8" }, body: "ok\nSUGGESTIONS: []" });
+    });
+    await page.goto("/");
+    await page.waitForSelector("canvas", { timeout: 15000 });
+    await page.waitForSelector("#community-legend .comm-chip", { timeout: 10000 });
+
+    // isolate the first community, then ask about it with no node selected
+    await page.locator("#community-legend .comm-chip").first().click();
+    await page.click("#copilot-btn");
+    await page.fill("#cop-input", "what is this community about");
+    await page.click("#cop-send");
+
+    await expect.poll(() => captured?.context?.isolatedCommunity?.id, { timeout: 10000 }).not.toBeUndefined();
+    expect(captured.context.isolatedCommunity).not.toBeNull();
+    expect(Array.isArray(captured.context.isolatedCommunity.sample)).toBeTruthy();
+    expect(captured.context.viewMode).toBe("community");
+  });
+
   test("chat input shows a scrollbar only when overflowing", async ({ page }) => {
     await page.goto("/");
     await page.waitForSelector("canvas", { timeout: 15000 });
@@ -724,6 +761,33 @@ test.describe("Pathfinding panel", () => {
     await expect(result).not.toHaveText("Finding path…", { timeout: 10000 });
     await expect(result).toContainText("Michel Foucault");
     await expect(result).toContainText("AI Alignment");
+  });
+
+  test("add/remove extra node rows", async ({ page }) => {
+    await page.goto("/");
+    await page.waitForSelector("canvas", { timeout: 15000 });
+
+    await page.click("#path-add-node");
+    await expect(page.locator("#path-extra .path-node-row")).toHaveCount(1);
+    await page.click("#path-add-node");
+    await expect(page.locator("#path-extra .path-node-row")).toHaveCount(2);
+    await page.locator("#path-extra .path-node-remove").first().click();
+    await expect(page.locator("#path-extra .path-node-row")).toHaveCount(1);
+  });
+
+  test("connects 3 nodes via pairwise paths", async ({ page }) => {
+    await page.goto("/");
+    await page.waitForSelector("canvas", { timeout: 15000 });
+
+    await page.click("#path-add-node");
+    await page.fill("#path-from", "Michel Foucault");
+    await page.fill("#path-to", "AI Alignment");
+    await page.fill("#path-extra .path-node-input", "Friedrich Nietzsche");
+    await page.keyboard.press("Escape");
+    await page.locator("#find-path-btn").click({ force: true });
+
+    await expect(page.locator("#path-result")).toContainText("Connected", { timeout: 15000 });
+    await expect(page.locator("#find-path-btn")).toHaveText("Reset path");
   });
 
   test("reports a missing node when the endpoint isn't in the graph", async ({ page }) => {

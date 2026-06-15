@@ -81,6 +81,20 @@
     /* pathfinding */
     #path-panel { border-top: 1px solid rgba(255,255,255,0.06); padding-top: 11px; }
     .path-inputs { display: flex; flex-direction: column; gap: 4px; }
+    #path-extra { display: flex; flex-direction: column; gap: 4px; }
+    .path-node-row { display: flex; gap: 4px; align-items: center; }
+    .path-node-remove {
+      width: 22px; height: 26px; flex-shrink: 0; border-radius: 5px;
+      background: rgba(255,255,255,0.05); border: 1px solid rgba(255,255,255,0.09);
+      color: #888; cursor: pointer; font-size: 15px; line-height: 1; padding: 0;
+    }
+    .path-node-remove:hover { background: rgba(251,146,60,0.15); border-color: rgba(251,146,60,0.3); color: #fb923c; }
+    .path-add-btn {
+      width: 100%; margin-top: 5px; padding: 4px; font-size: 11px;
+      background: transparent; border: 1px dashed rgba(255,255,255,0.15);
+      border-radius: 5px; color: #777; cursor: pointer; transition: all 0.15s;
+    }
+    .path-add-btn:hover { border-color: rgba(167,139,250,0.4); color: #a78bfa; }
     #find-path-btn {
       width: 100%; margin-top: 5px; padding: 5px;
       background: rgba(167,139,250,0.15); border: 1px solid rgba(167,139,250,0.28);
@@ -581,7 +595,7 @@
 
   <!-- PATHFINDING -->
   <div id="path-panel">
-    <div class="section-label">Pathfinding</div>
+    <div class="section-label">Pathfinding <span style="color:#333">(2+ nodes)</span></div>
     <div class="path-inputs">
       <div class="ac-wrap">
         <input id="path-from" type="text" placeholder="From (note title)" autocomplete="off" />
@@ -593,7 +607,9 @@
         <button class="input-clear" id="path-to-clear" title="Clear">×</button>
         <div class="ac-drop" id="path-to-ac"></div>
       </div>
+      <div id="path-extra"></div>
     </div>
+    <button id="path-add-node" class="path-add-btn">+ add node</button>
     <button id="find-path-btn">Find path</button>
     <div id="path-result"></div>
   </div>
@@ -808,8 +824,8 @@ const Graph = ForceGraph3D()(document.getElementById("graph-container"))
   .linkDirectionalArrowLength(l => l.relType === "AUTHORED_BY" ? 3 : 0)
   .linkDirectionalArrowRelPos(1)
   .onNodeClick(onNodeClick)
-  .onNodeHover(onNodeHover)
-  .onNodeRightClick(node => showNodeDetailPanel(node));
+  .onNodeHover(onNodeHover);
+  // right-click is reserved for a future node options menu
 
 // ─── Utilities ────────────────────────────────────────────────────────────────
 
@@ -1085,7 +1101,7 @@ async function showNodeDetailPanel(node) {
       const rawHtml = marked.parse(note.body || "_No content_");
       const withWikilinks = rawHtml.replace(
         /\[\[([^\]|#]+?)(?:[|#][^\]]*)?\]\]/g,
-        (_, name) => `<span class="wikilink" onclick="searchNode('${name.replace(/'/g,"\\'")}')">[[${name}]]</span>`
+        (_, name) => `<span class="wikilink" onclick="openNoteFromWikilink('${name.replace(/'/g,"\\'")}')">[[${name}]]</span>`
       );
       bodyEl.innerHTML = withWikilinks;
     } catch(e) {
@@ -1277,9 +1293,98 @@ async function runFindPath(from, to) {
   }
 }
 
+// ─── Multi-node path exploration (3+ nodes) ───────────────────────────────────
+
+let pathRowSeq = 0;
+
+// Add an extra node input row (capped so we don't explode the pairwise search).
+function addPathRow() {
+  const extra = document.getElementById("path-extra");
+  if (extra.querySelectorAll(".path-node-row").length >= 4) return;  // 2 base + 4 = 6 max
+  const id = "path-extra-" + (pathRowSeq++);
+  const row = document.createElement("div");
+  row.className = "path-node-row";
+  row.innerHTML =
+    `<div class="ac-wrap" style="flex:1;min-width:0">` +
+      `<input id="${id}" class="path-node-input" type="text" placeholder="Also connect…" autocomplete="off" />` +
+      `<button class="input-clear" title="Clear">×</button>` +
+      `<div class="ac-drop" id="${id}-ac"></div>` +
+    `</div>` +
+    `<button class="path-node-remove" title="Remove">−</button>`;
+  const input = row.querySelector("input");
+  const clearBtn = row.querySelector(".input-clear");
+  makeAutocomplete(input, row.querySelector(".ac-drop"), () => {});
+  input.addEventListener("input", () => { clearBtn.style.display = input.value ? "block" : "none"; });
+  clearBtn.addEventListener("click", () => { input.value = ""; clearBtn.style.display = "none"; input.dispatchEvent(new Event("input")); input.focus(); });
+  row.querySelector(".path-node-remove").addEventListener("click", () => row.remove());
+  extra.appendChild(row);
+  input.focus();
+}
+
+function collectPathNodes() {
+  const vals = [];
+  const from = document.getElementById("path-from").value.trim();
+  const to   = document.getElementById("path-to").value.trim();
+  if (from) vals.push(from);
+  if (to) vals.push(to);
+  document.querySelectorAll("#path-extra .path-node-input").forEach(inp => {
+    const v = inp.value.trim();
+    if (v) vals.push(v);
+  });
+  return vals;
+}
+
+// Connect 3+ nodes: union of all pairwise shortest paths, isolated in the view.
+async function runMultiPath(titles) {
+  const btn = document.getElementById("find-path-btn");
+  const out = document.getElementById("path-result");
+  const resolved = titles.map(resolveNodeTitle);
+  const missing = titles.filter((t, i) => !resolved[i]);
+  if (missing.length) {
+    out.textContent = `No node found for: ${missing.join(", ")}`;
+    return { ok: false, missing };
+  }
+  out.textContent = `Connecting ${resolved.length} nodes…`;
+
+  const pairs = [];
+  for (let i = 0; i < resolved.length; i++)
+    for (let j = i + 1; j < resolved.length; j++) pairs.push([resolved[i], resolved[j]]);
+
+  try {
+    const results = await Promise.all(pairs.map(([a, b]) =>
+      fetch(`/api/path?from=${encodeURIComponent(a)}&to=${encodeURIComponent(b)}`)
+        .then(r => r.json()).catch(() => ({ chain: [] }))
+    ));
+    const titleSet = new Set();
+    let linked = 0;
+    results.forEach(d => { if (d.chain?.length) { linked++; d.chain.forEach(t => titleSet.add(t)); } });
+    if (!titleSet.size) { out.textContent = "No connections found between those nodes."; return { ok: false }; }
+
+    pathNodeIds.clear();
+    titleSet.forEach(t => { const n = allNodes.find(x => x.title === t); if (n) pathNodeIds.add(n.id); });
+    currentPathChain = [...titleSet];
+    pathIsolationActive = true;
+    btn.textContent = "Reset path";
+    btn.classList.add("path-reset-mode");
+    highlightIds.clear();
+    applyFilters();
+    out.innerHTML = `Connected <span style="color:#a78bfa">${resolved.length}</span> nodes through ` +
+      `<span style="color:#a78bfa">${titleSet.size}</span> total ` +
+      `<br><small style="color:#444460">${linked}/${pairs.length} pairs linked</small>`;
+    return { ok: true, nodes: [...titleSet] };
+  } catch (e) {
+    out.textContent = "Error: " + e.message;
+    return { ok: false, note: e.message };
+  }
+}
+
+document.getElementById("path-add-node").addEventListener("click", addPathRow);
 document.getElementById("find-path-btn").addEventListener("click", () => {
   if (pathIsolationActive) { resetPathIsolation(); return; }
-  runFindPath(document.getElementById("path-from").value, document.getElementById("path-to").value);
+  const vals = collectPathNodes();
+  if (vals.length < 2) return;
+  if (vals.length === 2) runFindPath(vals[0], vals[1]);
+  else runMultiPath(vals);
 });
 
 // ─── Node click handler ───────────────────────────────────────────────────────
@@ -1307,6 +1412,14 @@ function searchNode(title) {
   const input = document.getElementById("search");
   input.value = title;
   input.dispatchEvent(new Event("input"));
+}
+
+// Clicking a [[wikilink]] opens that note in the Node panel (no search box).
+function openNoteFromWikilink(title) {
+  const q = normalizeStr(String(title).trim());
+  const node = allNodes.find(n => normalizeStr(n.title) === q)
+            || allNodes.find(n => normalizeStr(n.title).includes(q));
+  if (node) showNodeDetailPanel(node);
 }
 
 // ─── Panel close handlers ─────────────────────────────────────────────────────
@@ -1355,6 +1468,7 @@ function resetView() {
   document.getElementById("path-result").textContent = "";
   document.getElementById("path-from").value = "";
   document.getElementById("path-to").value = "";
+  document.getElementById("path-extra").innerHTML = "";
   document.getElementById("search").value = "";
   // Reset clear button visibility
   document.querySelectorAll(".input-clear").forEach(b => b.style.display = "none");
@@ -1410,8 +1524,17 @@ function neighborTitles(node, cap) {
   return [...ids].map(id => nodeById[id]?.title).filter(Boolean);
 }
 
+// Highest-degree nodes within a community (its most representative members).
+function communityTopNodes(cid, k) {
+  return allNodes
+    .filter(n => n.community === cid)
+    .sort((a, b) => (b.degree || 0) - (a.degree || 0))
+    .slice(0, k);
+}
+
 // Relevant nodes for the question, with compact graph facts. Explicit @-mentions
-// come first, then the selected node, path, and question title-matches.
+// come first, then the selected node, path, question matches — and, when a community
+// is isolated, its representative members (so "what's this community about" is grounded).
 function buildRetrieval(question) {
   const picked = new Map();
   const add = n => { if (n && !picked.has(n.id)) picked.set(n.id, n); };
@@ -1419,6 +1542,7 @@ function buildRetrieval(question) {
   if (currentSelectedNode) add(currentSelectedNode);
   (currentPathChain || []).forEach(title => add(allNodes.find(n => n.title === title)));
   entityLink(question, 3).forEach(add);
+  if (isolatedComm !== null) communityTopNodes(isolatedComm, 3).forEach(add);
   return [...picked.values()].slice(0, 4).map(n => ({
     title: n.title, type: n.type, community: n.community, path: n.path,
     neighbors: neighborTitles(n, 12),
@@ -1429,6 +1553,17 @@ function buildCopilotContext(question) {
   const comms = new Set(allNodes.map(n => n.community).filter(c => c != null));
   const activeFilters = [...document.querySelectorAll("#type-filters .chip.active")]
     .map(c => c.dataset.type).filter(Boolean);
+
+  let isolatedCommunity = null;
+  if (isolatedComm !== null) {
+    const members = allNodes.filter(n => n.community === isolatedComm);
+    isolatedCommunity = {
+      id: isolatedComm,
+      size: members.length,
+      sample: communityTopNodes(isolatedComm, 8).map(n => n.title),
+    };
+  }
+
   return {
     graphStats: {
       nodes: allNodes.length,
@@ -1446,7 +1581,11 @@ function buildCopilotContext(question) {
     currentPath: currentPathChain,
     activeFilters,
     colorMode,
-    viewMode: pathIsolationActive ? "path" : "graph",
+    sizeMode,
+    edgeMode,
+    isolatedCommunity,
+    overlays: { hubs: showHubs, orphans: showOrphans, linkHints: showSuggestions },
+    viewMode: pathIsolationActive ? "path" : (isolatedComm !== null ? "community" : "graph"),
   };
 }
 
@@ -1565,7 +1704,7 @@ async function renderAssistantMarkdown(textEl, text) {
   const rawHtml = marked.parse(text || "");
   textEl.innerHTML = rawHtml.replace(
     /\[\[([^\]|#]+?)(?:[|#][^\]]*)?\]\]/g,
-    (_, name) => `<span class="wikilink" onclick="searchNode('${name.replace(/'/g, "\\'")}')">[[${name}]]</span>`
+    (_, name) => `<span class="wikilink" onclick="openNoteFromWikilink('${name.replace(/'/g, "\\'")}')">[[${name}]]</span>`
   );
   // render any ```mermaid blocks into SVG; leave raw code on failure
   const blocks = textEl.querySelectorAll("code.language-mermaid");

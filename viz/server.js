@@ -86,28 +86,24 @@ function buildSystemPrompt(ctx) {
   const node = ctx.selectedNode;
   const pathStr = (ctx.currentPath || []).join(" → ");
   const vault = buildVaultContext(ctx.retrieval);
+  const ic = ctx.isolatedCommunity;
+  const ov = ctx.overlays || {};
+  const activeOverlays = [ov.hubs && "hub nodes", ov.orphans && "isolated clusters", ov.linkHints && "link hints"]
+    .filter(Boolean).join(", ");
 
   return `You are an AI research assistant embedded in a 3D knowledge graph visualization of a personal knowledge management (PKM) vault. The vault contains interconnected notes on philosophy, technology, and culture.
 
-Graph overview:
-- Total nodes: ${stats.nodes ?? "unknown"}
-- Total edges: ${stats.edges ?? "unknown"}
-- Communities (Leiden clustering): ${stats.communities ?? "unknown"}
-- Current color mode: ${ctx.colorMode ?? "community"}
-- Active node type filters: ${(ctx.activeFilters || []).join(", ") || "all types"}
-- View mode: ${ctx.viewMode ?? "full graph"}
-${node ? `
-Currently selected node:
-- Title: ${node.title}
-- Type: ${node.type}
-- Community: ${node.community ?? "none"}
-- Connections (degree): ${node.degree ?? "unknown"}
-- Betweenness centrality: ${node.betweenness ? Number(node.betweenness).toFixed(0) : "unknown"}
-` : "No node currently selected."}${pathStr ? `
-Current path being explored: ${pathStr}
-` : ""}
-Node types in the vault: concept, person, source, project, synthesis, entity.
-Relationships: RELATED_TO (explicit connections), LINKS_TO (wikilinks), AUTHORED_BY (person→work).
+Graph overview: ${stats.nodes ?? "?"} nodes, ${stats.edges ?? "?"} edges, ${stats.communities ?? "?"} communities (Leiden). Node types: concept, person, source, project, synthesis, entity. Relationships: RELATED_TO (explicit), LINKS_TO (wikilinks), AUTHORED_BY (person→work).
+
+═══ Current view (what the user is looking at RIGHT NOW) ═══
+- View mode: ${ctx.viewMode ?? "full graph"}; color by ${ctx.colorMode ?? "community"}; type filters: ${(ctx.activeFilters || []).join(", ") || "all"}${activeOverlays ? `; overlays: ${activeOverlays}` : ""}
+${ic ? `- COMMUNITY ${ic.id} is ISOLATED — only its ${ic.size} nodes are shown. Most-connected members: ${(ic.sample || []).join(", ")}.
+` : ""}${node ? `- SELECTED NODE: "${node.title}" (${node.type}, community ${node.community ?? "none"}, degree ${node.degree ?? "?"}, betweenness ${node.betweenness ? Number(node.betweenness).toFixed(0) : "?"}).
+` : "- No node is selected.\n"}${pathStr ? `- Path being explored: ${pathStr}
+` : ""}Disambiguation — answer about whatever the question refers to, do NOT default to one over the other:
+• "this community" / "this cluster" / "these" → ${ic ? `Community ${ic.id} (use its members + Vault Context)` : "the current view"}.
+• "this node" / "this concept" / "this person" / singular "it" → ${node ? `"${node.title}"` : "the selected node (none right now)"}.
+═══════════════════════════════════════════════════════════
 ${vault ? `
 ═══ Vault Context (authoritative — answer FROM this) ═══
 ${vault}
