@@ -6,14 +6,19 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-VAULT_ROOT="${VAULT_ROOT:-$(cd "$SCRIPT_DIR/../pkm" && pwd)}"
+VAULT_ROOT="${VAULT_ROOT:-$(cd "$SCRIPT_DIR/../pkm" && pwd 2>/dev/null || true)}"
 export VAULT_ROOT
+if [ -z "$VAULT_ROOT" ]; then
+  echo "ERROR: VAULT_ROOT is not set and default path '$SCRIPT_DIR/../pkm' does not exist."
+  echo "       Set it with: export VAULT_ROOT=/path/to/your/vault"
+  exit 1
+fi
 VIZ_DIR="$SCRIPT_DIR/viz"
 BOLT="bolt://localhost:7687"
 NEO4J_HTTP="http://localhost:7474"
 # Port the viz server listens on — honor PORT from the env or viz/.env (default 3000),
 # so start.sh checks/opens the same port server.js binds.
-VIZ_PORT="${PORT:-$(grep -E '^PORT=' "$VIZ_DIR/.env" 2>/dev/null | tail -1 | cut -d= -f2 | tr -d '[:space:]')}"
+VIZ_PORT="${PORT:-$(grep -E '^PORT=' "$VIZ_DIR/.env" 2>/dev/null | tail -1 | cut -d= -f2 | tr -d '[:space:]' || true)}"
 VIZ_PORT="${VIZ_PORT:-3000}"
 CONTAINER_NAME="pkm-graph"
 EMBED_MODEL="${EMBED_MODEL:-nomic-embed-text}"
@@ -41,7 +46,19 @@ echo "Runtime: $CTR"
 # ── 1. Neo4j ─────────────────────────────────────────────────────────────────
 step "Neo4j"
 
+if ! $CTR info > /dev/null 2>&1; then
+  echo "ERROR: $CTR daemon is not running."
+  case "$(uname -s)" in
+    Darwin) echo "       Start Docker Desktop and try again." ;;
+    Linux)  echo "       Run: sudo systemctl start docker" ;;
+    *)      echo "       Start the $CTR daemon and try again." ;;
+  esac
+  exit 1
+fi
+
 if $CTR ps --format '{{.Names}}' | grep -q "^${CONTAINER_NAME}$"; then
+  # Container is running but may be stuck in a PID-file restart loop; clear it proactively.
+  $CTR exec "$CONTAINER_NAME" rm -f /var/lib/neo4j/run/neo4j.pid > /dev/null 2>&1 || true
   ok "Container '$CONTAINER_NAME' already running"
 elif $CTR ps -a --format '{{.Names}}' | grep -q "^${CONTAINER_NAME}$"; then
   log "Starting existing container '$CONTAINER_NAME'..."
@@ -136,9 +153,26 @@ if "$PYTHON" "$SCRIPT_DIR/sync.py" --vault . --bolt "$BOLT" --auth neo4j:neo4jpa
   ok "Communities, centrality & pathfinding ready"
 else
   warn "Graph analytics step failed — the server will rebuild the projection on demand"
+  warn "Re-run manually: $PYTHON $SCRIPT_DIR/sync.py --gds --bolt $BOLT --auth neo4j:neo4jpass"
 fi
 
-# ── 6. Viz server ─────────────────────────────────────────────────────────────
+# ── 6. Viz config ─────────────────────────────────────────────────────────────
+step "Viz config"
+
+if [ ! -f "$VIZ_DIR/.env" ]; then
+  log "Creating viz/.env from .env.example (edit it to add API keys)..."
+  cp "$VIZ_DIR/.env.example" "$VIZ_DIR/.env"
+  { grep -v '^VAULT_ROOT=' "$VIZ_DIR/.env"; printf 'VAULT_ROOT=%s\n' "$VAULT_ROOT"; } \
+    > "$VIZ_DIR/.env.tmp" && mv "$VIZ_DIR/.env.tmp" "$VIZ_DIR/.env"
+  ok "viz/.env created — edit it to configure AI providers"
+else
+  ok "viz/.env present"
+fi
+if ! grep -qE '^VAULT_ROOT=.+' "$VIZ_DIR/.env"; then
+  warn "VAULT_ROOT not set in viz/.env — server will exit immediately. Set it to: $VAULT_ROOT"
+fi
+
+# ── 7. Viz server ─────────────────────────────────────────────────────────────
 step "Visualization server"
 
 if curl -sf "http://localhost:${VIZ_PORT}" > /dev/null 2>&1; then
@@ -156,17 +190,24 @@ else
   VIZ_PID=$!
   echo $VIZ_PID > "$SCRIPT_DIR/viz.pid"
 
-  # Wait up to 10s
+  # Wait up to 10s for the server to respond
   ELAPSED=0
   until curl -sf "http://localhost:${VIZ_PORT}" > /dev/null 2>&1; do
     if [ $ELAPSED -ge 10 ]; then
-      warn "Viz server did not start — check $SCRIPT_DIR/viz.log"
+      if kill -0 "$VIZ_PID" 2>/dev/null; then
+        warn "Viz server (pid $VIZ_PID) is slow to start — check $SCRIPT_DIR/viz.log"
+      else
+        warn "Viz server crashed on startup — check $SCRIPT_DIR/viz.log"
+        tail -n 5 "$SCRIPT_DIR/viz.log" | while IFS= read -r line; do echo "    $line"; done
+      fi
       break
     fi
     sleep 1
     ELAPSED=$((ELAPSED + 1))
   done
-  ok "Viz server running (pid $VIZ_PID)"
+  if curl -sf "http://localhost:${VIZ_PORT}" > /dev/null 2>&1; then
+    ok "Viz server running (pid $VIZ_PID)"
+  fi
 fi
 
 # ── Done ──────────────────────────────────────────────────────────────────────
@@ -177,4 +218,8 @@ echo "  Neo4j     → $NEO4J_HTTP"
 echo "════════════════════════════════════"
 echo
 
-open "http://localhost:${VIZ_PORT}" 2>/dev/null || true
+if command -v open > /dev/null 2>&1; then
+  open "http://localhost:${VIZ_PORT}" 2>/dev/null || true
+elif command -v xdg-open > /dev/null 2>&1; then
+  xdg-open "http://localhost:${VIZ_PORT}" 2>/dev/null || true
+fi
